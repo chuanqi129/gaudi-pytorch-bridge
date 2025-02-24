@@ -1,0 +1,149 @@
+name: '_gaudi_hpu_build'
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+        description: 'The runner selected to run on'
+      image:
+        required: true
+        type: string
+        description: 'The docker image which will be used to build'
+      device:
+        required: true
+        type: string
+        description: 'The device selected to run on'
+      torch-artifact:
+        required: false
+        type: string
+        description: 'The distribution artifact name of torch'
+    outputs:
+      torch-hpu-artifact:
+        description: 'The distribution artifact name of torch_hpu'
+        value: ${{ jobs.build.outputs.dist-name }}
+
+# Bash shells do not use ~/.profile or ~/.bashrc so these shells need to be explicitly
+# declared as "shell: bash -el {0}" on steps that need to be properly activated.
+# It's used to activate ascend-toolkit environment variables.
+defaults:
+  run:
+    shell: bash -el {0}
+
+jobs:
+  build:
+    name: build torch_hpu
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: ${{ inputs.image }}
+      env:
+        HABANA_VISIBLE_DEVICES: all
+        OMPI_MCA_btl_vader_single_copy_mechanism: none
+      volumes:
+        - /opt/datasets:/datasets
+      options: >-
+        --network host
+        --ipc host
+        --cap-add sys_nice
+        --runtime habana
+    outputs:
+      dist-name: ${{ steps.list-dist.outputs.dist-name }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      # - name: Install system dependencies
+      #   run: |
+      #     apt-get update
+      #     apt-get install -y git gcc g++ make cmake ninja-build
+
+      # See: https://github.com/actions/checkout/issues/363#issuecomment-1915075699
+      - name: Config git
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout torch_hpu
+        uses: actions/checkout@v4
+        with:
+          repository: HabanaAI/gaudi-pytorch-bridge
+          ref: v1.20.0
+          submodules: recursive
+          path: torch_hpu
+
+      - name: Install torch_hpu dependencies
+        working-directory: torch_hpu
+        run: |
+          pip install wheel
+          pip install -r requirements.txt
+
+      - name: Download torch artifact
+        if: ${{ inputs.torch-artifact }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.torch-artifact }}
+
+      - name: Install torch
+        if: ${{ inputs.torch-artifact }}
+        run: |
+          pip install ${{ inputs.torch-artifact }}
+
+      - name: List Python version
+        id: list-py-version
+        working-directory: torch_hpu
+        run: |
+          py_version=$(python --version | awk '{print $2}' | cut -d '.' -f 1,2)
+          echo "py-version=${py_version}" >> $GITHUB_OUTPUT
+
+      - name: Build torch_hpu
+        working-directory: torch_hpu
+        run: |
+          echo "Call toch hpu bridge build script"
+          # bash ci/build.sh --python=${{ steps.list-py-version.outputs.py-version }}
+        env:
+          _GLIBCXX_USE_CXX11_ABI: 1 
+
+      - name: List distribution package
+        id: list-dist
+        working-directory: torch_hpu/dist
+        run: |
+          dist_name=$(ls torch_hpu*.whl)
+          dist_path=$(pwd)/${dist_name}
+          echo "dist-name=${dist_name}" >> $GITHUB_OUTPUT
+          echo "dist-path=${dist_path}" >> $GITHUB_OUTPUT
+
+      - name: Install torch_hpu
+        working-directory: torch_hpu/dist
+        run: |
+          pip install ${{ steps.list-dist.outputs.dist-name }}
+
+      - name: List torch_hpu version
+        id: list-version
+        run: |
+          echo "List version"
+        #   torch_version=$(python -c "import torch; print(torch.__version__)")
+        #   torch_hpu_version=$(python -c "import torch_hpu; print(torch_hpu.__version__)")
+        #   echo "torch version: ${torch_version}"
+        #   echo "torch_hpu version: ${torch_hpu_version}"
+        #   echo "torch-npu-version=${torch_hpu_version}" >> $GITHUB_OUTPUT
+
+      - name: Upload distribution artifact
+        id: upload-dist
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ steps.list-dist.outputs.dist-name }}
+          path: ${{ steps.list-dist.outputs.dist-path }}
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+      - name: Write to workflow job summary
+        if: ${{ steps.upload-dist.outputs.artifact-url }}
+        run: |
+          echo "## torch_hpu-${{ steps.list-version.outputs.torch-npu-version }} built successfully! :rocket:" >> $GITHUB_STEP_SUMMARY
+          echo "You can download the distribution package [here](${{ steps.upload-dist.outputs.artifact-url }})." >> $GITHUB_STEP_SUMMARY

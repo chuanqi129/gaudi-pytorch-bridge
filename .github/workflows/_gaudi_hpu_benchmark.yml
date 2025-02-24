@@ -1,0 +1,202 @@
+
+name: '_gaudi_hpu_benchmark'
+
+on:
+  workflow_call:
+    inputs:
+      runner:
+        required: true
+        type: string
+        description: 'The runner selected to run on'
+      image:
+        required: true
+        type: string
+        description: 'The docker image which will be loaded'
+      device:
+        required: true
+        type: string
+        description: 'The device selected to run on'
+      torch-artifact:
+        required: false
+        type: string
+        description: 'The distribution artifact name of torch'
+      torch-hpu-artifact:
+        required: true
+        type: string
+        description: 'The distribution artifact name of torch_hpu'
+    secrets:
+      pr-token:
+        description: 'A token used to create a pull request'
+        required: true
+
+# Bash shells do not use ~/.profile or ~/.bashrc so these shells need to be explicitly
+# declared as "shell: bash -el {0}" on steps that need to be properly activated.
+# It's used to activate ascend-toolkit environment variables.
+defaults:
+  run:
+    shell: bash -el {0}
+
+jobs:
+  test:
+    name: run benchmarks for torch_hpu
+    runs-on: ${{ inputs.runner }}
+    container:
+      image: ${{ inputs.image }}
+      volumes:
+        - /usr/local/dcmi:/usr/local/dcmi
+        - /usr/local/bin/hl-smi:/usr/local/bin/hl-smi
+      options: >-
+        --network host
+        --device ${{ inputs.device }}
+      env:
+        HF_ENDPOINT: https://hf-mirror.com
+    steps:
+      - name: Show HPU info
+        run: |
+          hl-smi info
+
+      - name: Config mirrors
+        run: |
+          sed -i 's|ports.ubuntu.com|mirrors.tuna.tsinghua.edu.cn|g' /etc/apt/sources.list
+          pip config set global.index-url https://mirrors.tuna.tsinghua.edu.cn/pypi/web/simple
+
+      - name: Install system dependencies
+        run: |
+          apt-get update
+          apt-get install -y \
+              git gcc g++ make cmake ninja-build curl \
+              libgl1 libglib2.0-0 libsndfile1
+
+      # See: https://github.com/actions/checkout/issues/363#issuecomment-1915075699
+      - name: Config git
+        run: |
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Checkout benchmark
+        uses: actions/checkout@v4
+        with:
+          repository: pytorch/benchmark
+          path: benchmark
+
+      - name: Download torch artifact
+        if: ${{ inputs.torch-artifact }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.torch-artifact }}
+
+      - name: Install torch
+        if: ${{ inputs.torch-artifact }}
+        run: |
+          pip install ${{ inputs.torch-artifact }}
+
+      - name: Install torch_hpu dependencies
+        if: ${{ !inputs.torch-artifact }}
+        run: |
+          pip install -r https://raw.githubusercontent.com/HabanaAI/gaudi-pytorch-bridge/refs/heads/v1.19.0/requirements.txt
+
+      - name: List torch version
+        id: list-torch-version
+        shell: bash
+        run: |
+          torch_version=$(python -c "import torch; print(torch.__version__)")
+          echo "torch-version=${torch_version}" >> $GITHUB_OUTPUT
+
+      - name: Download torch_hpu artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ inputs.torch-hpu-artifact }}
+          path: gaudi_hpu
+
+      - name: Install torch_hpu
+        working-directory: gaudi_hpu
+        run: |
+          pip install ${{ inputs.torch-hpu-artifact }}
+
+      - name: Install benchmark dependencies
+        run: |
+          pip install -r benchmark/requirements.txt \
+              torch==${{ steps.list-torch-version.outputs.torch-version }} \
+              numpy==1.*
+
+      - name: Install dependencies for all the models
+        run: |
+          python benchmark/install.py --userbenchmark test_bench --continue_on_fail
+
+      - name: Install nightly torchvision and torchaudio
+        run: |
+          pip install --pre torchvision torchaudio --no-deps --index-url https://download.pytorch.org/whl/nightly/cpu
+
+      - name: Install project dependencies
+        run: |
+          pip install -r requirements.txt
+
+      - name: Show environment info
+        run: |
+          hpu_is_available=$(python -c "import torch; print(torch.hpu.is_available())")
+          hpu_count=$(python -c "import torch; print(torch.hpu.device_count())")
+          echo "HPU is available: ${hpu_is_available}"
+          echo "HPU count: ${hpu_count}"
+          pip list | grep -E 'torch|numpy'
+
+      - name: Run benchmarks
+        working-directory: benchmark
+        run: |
+          python run_benchmark.py test_bench --accuracy --device npu --test eval \
+              --output gaudi_hpu_benchmark.json
+
+      - name: Upload the benchmark report file
+        id: upload-report
+        uses: actions/upload-artifact@v4
+        with:
+          name: gaudi_hpu_benchmark.json
+          path: benchmark/gaudi_hpu_benchmark.json
+          if-no-files-found: error
+          retention-days: 1
+          overwrite: true
+
+      - name: Write to workflow job summary
+        run: |
+          python .ci/benchmark.py --write-gh-job-summary --path benchmark/gaudi_hpu_benchmark.json
+
+      - name: Update README.md
+        if: ${{ contains(fromJSON('["push", "schedule", "workflow_dispatch"]'), github.event_name) }}
+        id: update-readme
+        run: |
+          python .ci/benchmark.py --update-readme --path benchmark/gaudi_hpu_benchmark.json
+          if git diff --quiet README.md; then
+            echo "README.md not changed"
+            echo "changed=false" >> $GITHUB_OUTPUT
+          else
+            echo "README.md changed"
+            echo "changed=true" >> $GITHUB_OUTPUT
+          fi
+
+      # See: https://github.com/peter-evans/create-pull-request
+      - name: Create a pull request for changes to README.md
+        if: ${{ steps.update-readme.outputs.changed == 'true' }}
+        uses: peter-evans/create-pull-request@v7
+        with:
+          token: ${{ secrets.pr-token }}
+          base: ${{ github.head_ref }}
+          committer: 'cosdt-bot <cosdtbot@gmail.com>'
+          author: 'cosdt-bot <cosdtbot@gmail.com>'
+          commit-message: 'Update torchbenchmark report in README.md'
+          add-paths: README.md
+          branch: ascend-npu/benchmark
+          title: '[Ascend NPU] Update torchbenchmark report in README.md'
+          body: |
+            The torchbenchmark results running on Ascend NPU have changed, I'm updating the report in README.md.
+
+            Please check out the following resources for more information:
+
+            - [Workflow run][1]
+            - [Torchbenchmark report][2] (click to download)
+
+            [1]: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            [2]: ${{ steps.upload-report.outputs.artifact-url }}
+
+            cc: @chuanqi129
+          reviewers: chuanqi129
